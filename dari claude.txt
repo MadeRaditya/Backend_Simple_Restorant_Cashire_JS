@@ -1,0 +1,467 @@
+// orderRoutes.js
+const express = require('express');
+const orderController = require('../controllers/orderController');
+const router = express.Router();
+const verifyToken = require('../middleware/verifyToken');
+
+router.post('/order', verifyToken, orderController.createOrderController);
+router.get('/order/:id', verifyToken, orderController.fetchOrderByIdController);
+router.get('/orders', verifyToken, orderController.fetchAllOrdersController);
+router.put('/order/:id', verifyToken, orderController.updateOrderController);
+router.delete('/order/:id', verifyToken, orderController.cancelOrderController);
+
+module.exports = router;
+
+// orderController.js
+const orderModel = require('../models/OrderModel');
+const orderItemModel = require('../models/OrderItemModel');
+
+const createOrderController = async (req, res) => {
+    const { userId, tableId, orderType, items } = req.body;
+
+    // Validation
+    if (!userId || !orderType || !items || !Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ 
+            message: 'Invalid input: userId, orderType, and items array are required' 
+        });
+    }
+
+    try {
+        // Calculate total amount
+        const totalAmount = items.reduce((sum, item) => {
+            return sum + (parseFloat(item.price) * parseInt(item.quantity));
+        }, 0);
+
+        // Create order
+        const orderResult = await orderModel.createOrder(
+            userId, 
+            tableId, 
+            orderType, 
+            totalAmount
+        );
+
+        // Add order items
+        await orderItemModel.addOrderItems(orderResult.insertId, items);
+
+        // If it's dine-in, update table status
+        if (orderType === 'dine-in' && tableId) {
+            await orderModel.updateTableStatus(tableId, 'occupied');
+        }
+
+        res.status(201).json({ 
+            message: 'Order created successfully',
+            orderId: orderResult.insertId,
+            totalAmount
+        });
+    } catch (error) {
+        console.error('Order creation error:', error);
+        res.status(500).json({ 
+            message: 'Error creating order',
+            error: error.message 
+        });
+    }
+};
+
+const fetchOrderByIdController = async (req, res) => {
+    const { id } = req.params;
+
+    try {
+        const order = await orderModel.fetchOrderById(id);
+        if (!order) {
+            return res.status(404).json({ message: 'Order not found' });
+        }
+
+        // Get order items
+        const orderItems = await orderItemModel.fetchOrderItems(id);
+        
+        res.status(200).json({
+            order,
+            items: orderItems
+        });
+    } catch (error) {
+        console.error('Fetch order error:', error);
+        res.status(500).json({ 
+            message: 'Error fetching order',
+            error: error.message 
+        });
+    }
+};
+
+const fetchAllOrdersController = async (req, res) => {
+    try {
+        const orders = await orderModel.fetchAllOrders();
+        res.status(200).json(orders);
+    } catch (error) {
+        console.error('Fetch all orders error:', error);
+        res.status(500).json({ 
+            message: 'Error fetching orders',
+            error: error.message 
+        });
+    }
+};
+
+const updateOrderController = async (req, res) => {
+    const { id } = req.params;
+    const { items } = req.body;
+
+    try {
+        // Verify order exists and is pending
+        const order = await orderModel.fetchOrderById(id);
+        if (!order || order.status !== 'pending') {
+            return res.status(400).json({ 
+                message: 'Order not found or cannot be modified' 
+            });
+        }
+
+        // Calculate new total
+        const totalAmount = items.reduce((sum, item) => {
+            return sum + (parseFloat(item.price) * parseInt(item.quantity));
+        }, 0);
+
+        // Update order items
+        await orderItemModel.updateOrderItems(id, items);
+        await orderModel.updateOrderTotal(id, totalAmount);
+
+        res.status(200).json({ 
+            message: 'Order updated successfully',
+            orderId: id,
+            totalAmount
+        });
+    } catch (error) {
+        console.error('Order update error:', error);
+        res.status(500).json({ 
+            message: 'Error updating order',
+            error: error.message 
+        });
+    }
+};
+
+const cancelOrderController = async (req, res) => {
+    const { id } = req.params;
+
+    try {
+        const order = await orderModel.fetchOrderById(id);
+        if (!order || order.status !== 'pending') {
+            return res.status(400).json({ 
+                message: 'Order not found or cannot be cancelled' 
+            });
+        }
+
+        await orderModel.updateOrderStatus(id, 'cancelled');
+        
+        // If it was dine-in, free up the table
+        if (order.order_type === 'dine-in' && order.table_id) {
+            await orderModel.updateTableStatus(order.table_id, 'available');
+        }
+
+        res.status(200).json({ message: 'Order cancelled successfully' });
+    } catch (error) {
+        console.error('Order cancellation error:', error);
+        res.status(500).json({ 
+            message: 'Error cancelling order',
+            error: error.message 
+        });
+    }
+};
+
+module.exports = {
+    createOrderController,
+    fetchOrderByIdController,
+    fetchAllOrdersController,
+    updateOrderController,
+    cancelOrderController
+};
+
+// OrderModel.js
+const db = require('../config/db');
+
+class OrderModel {
+    static createOrder(userId, tableId, orderType, totalAmount) {
+        return new Promise((resolve, reject) => {
+            const query = `
+                INSERT INTO orders 
+                (user_id, table_id, order_type, total_amount, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'pending', NOW(), NOW())
+            `;
+            
+            db.query(query, [userId, tableId, orderType, totalAmount], (err, result) => {
+                if (err) return reject(err);
+                resolve(result);
+            });
+        });
+    }
+
+    static fetchOrderById(id) {
+        return new Promise((resolve, reject) => {
+            const query = `
+                SELECT o.*, u.username AS user_name, t.table_number 
+                FROM orders o
+                LEFT JOIN users u ON o.user_id = u.id
+                LEFT JOIN tables t ON o.table_id = t.id
+                WHERE o.id = ?
+            `;
+            
+            db.query(query, [id], (err, results) => {
+                if (err) return reject(err);
+                resolve(results[0]);
+            });
+        });
+    }
+
+    static fetchAllOrders() {
+        return new Promise((resolve, reject) => {
+            const query = `
+                SELECT o.*, u.username AS user_name, t.table_number 
+                FROM orders o
+                LEFT JOIN users u ON o.user_id = u.id
+                LEFT JOIN tables t ON o.table_id = t.id
+                WHERE o.status != 'completed' AND o.status != 'cancelled'
+                ORDER BY o.created_at DESC
+            `;
+            
+            db.query(query, (err, results) => {
+                if (err) return reject(err);
+                resolve(results);
+            });
+        });
+    }
+
+    static updateOrderTotal(orderId, totalAmount) {
+        return new Promise((resolve, reject) => {
+            const query = 'UPDATE orders SET total_amount = ? WHERE id = ?';
+            
+            db.query(query, [totalAmount, orderId], (err, result) => {
+                if (err) return reject(err);
+                resolve(result);
+            });
+        });
+    }
+
+    static updateOrderStatus(orderId, status) {
+        return new Promise((resolve, reject) => {
+            const query = 'UPDATE orders SET status = ? WHERE id = ?';
+            
+            db.query(query, [status, orderId], (err, result) => {
+                if (err) return reject(err);
+                resolve(result);
+            });
+        });
+    }
+
+    static updateTableStatus(tableId, status) {
+        return new Promise((resolve, reject) => {
+            const query = 'UPDATE tables SET status = ? WHERE id = ?';
+            
+            db.query(query, [status, tableId], (err, result) => {
+                if (err) return reject(err);
+                resolve(result);
+            });
+        });
+    }
+}
+
+module.exports = OrderModel;
+
+// OrderItemModel.js
+const db = require('../config/db');
+
+class OrderItemModel {
+    static addOrderItems(orderId, items) {
+        return new Promise((resolve, reject) => {
+            const query = `
+                INSERT INTO order_items 
+                (order_id, menu_item_id, quantity, price) 
+                VALUES ?
+            `;
+            
+            const values = items.map(item => [
+                orderId,
+                item.menuItemId,
+                item.quantity,
+                item.price
+            ]);
+            
+            db.query(query, [values], (err, result) => {
+                if (err) return reject(err);
+                resolve(result);
+            });
+        });
+    }
+
+    static fetchOrderItems(orderId) {
+        return new Promise((resolve, reject) => {
+            const query = `
+                SELECT oi.*, mi.name, mi.category
+                FROM order_items oi
+                JOIN menu_items mi ON oi.menu_item_id = mi.id
+                WHERE oi.order_id = ?
+            `;
+            
+            db.query(query, [orderId], (err, results) => {
+                if (err) return reject(err);
+                resolve(results);
+            });
+        });
+    }
+
+    static updateOrderItems(orderId, items) {
+        return new Promise(async (resolve, reject) => {
+            try {
+                // First delete existing items
+                await db.query('DELETE FROM order_items WHERE order_id = ?', [orderId]);
+                
+                // Then insert new items
+                const query = `
+                    INSERT INTO order_items 
+                    (order_id, menu_item_id, quantity, price) 
+                    VALUES ?
+                `;
+                
+                const values = items.map(item => [
+                    orderId,
+                    item.menuItemId,
+                    item.quantity,
+                    item.price
+                ]);
+                
+                db.query(query, [values], (err, result) => {
+                    if (err) return reject(err);
+                    resolve(result);
+                });
+            } catch (error) {
+                reject(error);
+            }
+        });
+    }
+}
+
+module.exports = OrderItemModel;
+
+
+
+
+Saya akan menjelaskan kode yang saya berikan secara terstruktur:
+
+1. **orderRoutes.js**:
+- File ini menangani routing/endpoint untuk operasi order
+- Menggunakan Express Router untuk mengelola rute
+- Memiliki beberapa endpoint:
+  - POST `/order` - Membuat order baru
+  - GET `/order/:id` - Mengambil detail order tertentu
+  - GET `/orders` - Mengambil semua order
+  - PUT `/order/:id` - Mengupdate order
+  - DELETE `/order/:id` - Membatalkan order
+- Setiap route dilindungi dengan middleware `verifyToken` untuk autentikasi
+
+2. **orderController.js**:
+Berisi fungsi-fungsi untuk menangani logika bisnis:
+
+a. `createOrderController`:
+- Menerima data order dari request body (userId, tableId, orderType, items)
+- Memvalidasi input
+- Menghitung total amount dari items
+- Membuat order baru di database
+- Menambahkan item-item order
+- Mengupdate status meja jika dine-in
+
+b. `fetchOrderByIdController`:
+- Mengambil detail order berdasarkan ID
+- Mengambil item-item yang terkait dengan order tersebut
+- Menggabungkan informasi order dengan items
+
+c. `fetchAllOrdersController`:
+- Mengambil semua order yang aktif (tidak completed/cancelled)
+- Mengembalikan daftar order dengan informasi lengkap
+
+d. `updateOrderController`:
+- Memperbarui order yang ada
+- Memvalidasi status order (harus pending)
+- Menghitung ulang total amount
+- Memperbarui item-item order
+
+e. `cancelOrderController`:
+- Membatalkan order
+- Memperbarui status meja jika diperlukan
+- Memvalidasi bahwa order masih bisa dibatalkan
+
+3. **OrderModel.js**:
+Class yang menangani interaksi dengan database untuk tabel orders:
+
+- `createOrder`: Membuat order baru
+- `fetchOrderById`: Mengambil detail order dengan JOIN ke users dan tables
+- `fetchAllOrders`: Mengambil semua order aktif
+- `updateOrderTotal`: Memperbarui total amount order
+- `updateOrderStatus`: Memperbarui status order
+- `updateTableStatus`: Memperbarui status meja
+
+4. **OrderItemModel.js**:
+Class yang menangani interaksi dengan database untuk tabel order_items:
+
+- `addOrderItems`: Menambahkan item-item ke order
+- `fetchOrderItems`: Mengambil item-item untuk order tertentu
+- `updateOrderItems`: Memperbarui item-item dalam order
+
+Fitur Penting yang Ditambahkan:
+1. **Validasi Input**:
+```javascript
+if (!userId || !orderType || !items || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ 
+        message: 'Invalid input: userId, orderType, and items array are required' 
+    });
+}
+```
+
+2. **Penanganan Error**:
+```javascript
+try {
+    // kode...
+} catch (error) {
+    console.error('Error message:', error);
+    res.status(500).json({ 
+        message: 'Error message',
+        error: error.message 
+    });
+}
+```
+
+3. **Manajemen Status Meja**:
+```javascript
+if (orderType === 'dine-in' && tableId) {
+    await orderModel.updateTableStatus(tableId, 'occupied');
+}
+```
+
+4. **Query dengan JOIN**:
+```javascript
+SELECT o.*, u.username AS user_name, t.table_number 
+FROM orders o
+LEFT JOIN users u ON o.user_id = u.id
+LEFT JOIN tables t ON o.table_id = t.id
+```
+
+5. **Bulk Operations**:
+```javascript
+const values = items.map(item => [
+    orderId,
+    item.menuItemId,
+    item.quantity,
+    item.price
+]);
+```
+
+Perbedaan Utama dengan Versi PHP:
+1. Menggunakan Promises dan async/await untuk operasi asynchronous
+2. Struktur kode lebih modular dan berorientasi objek
+3. Penanganan error lebih robust
+4. Validasi input lebih ketat
+5. Response lebih terstruktur dengan status HTTP yang sesuai
+6. Pengelolaan status meja terintegrasi dengan operasi order
+
+Untuk menggunakan sistem ini, Anda perlu:
+1. Setup Express.js server
+2. Konfigurasi database MySQL
+3. Implementasi sistem autentikasi (JWT)
+4. Setup middleware verifyToken
+5. Konfigurasi route di aplikasi utama
+
+Apakah ada bagian spesifik yang ingin Anda pahami lebih dalam?
