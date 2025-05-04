@@ -156,8 +156,19 @@ Berikut beberapa endpoint penting (penjelasan lengkap bisa ditambahkan di dokume
 
 - File gambar disimpan di folder `public/assets/img`.
 
+--- 
+## Credential Login
+- **Admin**:
+  - Username : `admin`
+  - Password : `Admin#1234`
 
+- **Kasir**:
+  - Username : `kasir`
+  - Password : `Kasir#1234`
 
+- **Pelayan**:
+  - Username : `pelayan`
+  - Password : `Pelayan#1234`
 
 
 
